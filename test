@@ -1,1 +1,295 @@
+#include <opencv2/opencv.hpp>
+#include <Windows.h>
+#include <stdint.h>
+#include <iostream>
+#include <fstream>
+#include <stdio.h>
 
+
+constexpr float CONFIDENCE_THRESHOLD = 0;
+constexpr float NMS_THRESHOLD = 0.4;
+constexpr int NUM_CLASSES = 2;
+
+
+const cv::Scalar colors[] = {
+    {0, 255, 255},
+    {255, 255, 0},
+    {0, 255, 0},
+    {255, 0, 0}
+};
+const auto NUM_COLORS = sizeof(colors) / sizeof(colors[0]);
+
+
+int main()
+{
+    //setup variables
+#pragma region
+    cv::Mat blob, frame_RGB, frame_RGBA;
+    cv::Point closest, move;
+    std::vector<cv::Mat> detections;
+    std::string click, send;
+#pragma endregion
+
+
+    //OPTIONS
+#pragma region
+//Aim options
+    int aim_option = 0,  // 0 - casual aimbot, 1 - triggerbot, 2 hocus pocus enemy deletus / aimbot + trigger
+        offset_x = 0,
+        offset_y = 0,
+
+        part = 2,
+        of_parts = 5, // 1 / 2 = center = heigth / of_parts * part - proportions
+
+        trig_distance = 5;
+    float sensitivity = 0.5;
+
+    //FOV, screen dim
+    int FOV_x = 416,
+        FOV_y = 416,
+
+        screen_width = 1920,
+        screen_height = 1080;
+
+    //Arduino
+    std::wstring comport = L"COM4";
+
+    //Class filter
+    std::string prefered_class = "e_p";  // class name for specific class / all - for all classes
+
+    //Third Person
+    bool third_person = false;
+
+    auto square_tl = cv::Point(20, 280);
+    auto square_br = cv::Point(350, 608);
+#pragma endregion
+
+
+    //read classes file
+#pragma region
+    std::vector<std::string> class_names;
+    {
+        std::ifstream class_file("E:\\AIstuff\\yolov4\\LostLight\\yolov4-lostlight.labels");
+        std::string line;
+
+        while (std::getline(class_file, line)) {
+            class_names.push_back(line);
+        }
+    }
+#pragma endregion
+
+
+    //setupt, connect to Arduino
+#pragma region
+    HANDLE hSerial;
+
+    hSerial = CreateFile(comport.c_str(), GENERIC_WRITE, 0, NULL, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
+    DCB dcbSerialParams = { 0 };
+    dcbSerialParams.DCBlength = sizeof(dcbSerialParams);
+    GetCommState(hSerial, &dcbSerialParams);
+
+    dcbSerialParams.BaudRate = CBR_115200;
+    dcbSerialParams.ByteSize = 8;
+    dcbSerialParams.StopBits = ONESTOPBIT;
+    dcbSerialParams.Parity = NOPARITY;
+
+    SetCommState(hSerial, &dcbSerialParams);
+#pragma endregion
+
+
+    //setup screencap
+#pragma region
+    HBITMAP hBitmap;
+
+    HDC hdcSys = GetDC(NULL);
+    HDC hdcMem = CreateCompatibleDC(hdcSys);
+    void* ptrBitmapPixels;
+
+    BITMAPINFO bi; HDC hdc;
+    ZeroMemory(&bi, sizeof(BITMAPINFO));
+    bi.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
+    bi.bmiHeader.biWidth = FOV_x;
+    bi.bmiHeader.biHeight = -FOV_y;
+    bi.bmiHeader.biPlanes = 1;
+    bi.bmiHeader.biBitCount = 32;
+    hdc = GetDC(NULL);
+    hBitmap = CreateDIBSection(hdc, &bi, DIB_RGB_COLORS, &ptrBitmapPixels, NULL, 0);
+
+    SelectObject(hdcMem, hBitmap);
+    frame_RGBA = cv::Mat(FOV_y, FOV_x, CV_8UC4, ptrBitmapPixels, 0);
+#pragma endregion
+
+
+    //setup cv::dnn
+#pragma region
+    auto net = cv::dnn::readNetFromDarknet("E:\\AIstuff\\yolov4\\LostLight\\yolov4-lostlight.cfg", "E:\\AIstuff\\yolov4\\LostLight\\yolov4-lostlight.weights");
+    net.setPreferableBackend(cv::dnn::DNN_BACKEND_CUDA);
+    net.setPreferableTarget(cv::dnn::DNN_TARGET_CUDA);
+    auto output_names = net.getUnconnectedOutLayersNames();
+#pragma endregion
+
+
+    while (cv::waitKey(1) < 1)
+    {
+        //start FPS clock
+#pragma region 
+        auto start = std::chrono::high_resolution_clock::now();
+        closest = cv::Point(FOV_x, FOV_y);
+#pragma endregion
+
+
+        //update the pixels / refresh frame
+#pragma region
+        BitBlt(hdcMem, 0, 0, FOV_x, FOV_y, hdcSys, screen_width / 2 - FOV_x / 2, screen_height / 2 - FOV_y / 2, SRCCOPY);
+        cv::cvtColor(frame_RGBA, frame_RGB, cv::COLOR_RGBA2RGB);
+#pragma endregion
+
+        //cover up the our player with a filled square if thirds_person = true
+#pragma region
+        if ((GetKeyState(VK_RBUTTON) & 0x80) == 0)
+        {
+            if (third_person)
+            {
+                cv::rectangle(frame_RGB, square_tl, square_br, (255, 0, 0), -1);
+            }
+        }
+
+#pragma endregion
+
+        //construct blob from pixels and pass it through
+#pragma region 
+        cv::dnn::blobFromImage(frame_RGB, blob, 0.00392, cv::Size(416, 416), cv::Scalar(), true, false, CV_32F);
+        net.setInput(blob);
+        net.forward(detections, output_names);
+#pragma endregion
+
+        //from model output draw dettections
+#pragma region 
+        std::vector<int> indices[NUM_CLASSES];
+        std::vector<cv::Rect> boxes[NUM_CLASSES];
+        std::vector<float> scores[NUM_CLASSES];
+#pragma endregion
+
+        //extracting detections from model's output
+#pragma region
+        for (auto& output : detections)
+        {
+            const auto num_boxes = output.rows;
+            for (int i = 0; i < num_boxes; i++)
+            {
+                auto x = output.at<float>(i, 0) * frame_RGB.cols;
+                auto y = output.at<float>(i, 1) * frame_RGB.rows;
+                auto width = output.at<float>(i, 2) * frame_RGB.cols;
+                auto height = output.at<float>(i, 3) * frame_RGB.rows;
+                cv::Rect rect(x - width / 2, y - height / 2, width, height);
+
+                for (int c = 0; c < NUM_CLASSES; c++)
+                {
+                    auto confidence = *output.ptr<float>(i, 5 + c);
+                    if (confidence >= CONFIDENCE_THRESHOLD)
+                    {
+                        boxes[c].push_back(rect);
+                        scores[c].push_back(confidence);
+                    }
+                }
+            }
+        }
+
+        for (int c = 0; c < NUM_CLASSES; c++) {
+            cv::dnn::NMSBoxes(boxes[c], scores[c], 0.0, NMS_THRESHOLD, indices[c]);
+        }
+
+        for (int c = 0; c < NUM_CLASSES; c++)
+        {
+            for (size_t i = 0; i < indices[c].size(); ++i)
+            {
+                const auto color = colors[c % NUM_COLORS];
+
+                auto idx = indices[c][i];
+                const auto& rect = boxes[c][idx];
+                cv::rectangle(frame_RGB, cv::Point(rect.x, rect.y), cv::Point(rect.x + rect.width, rect.y + rect.height), color, 3);
+
+                std::ostringstream label_ss;
+                label_ss << class_names[c] << ": " << std::fixed << std::setprecision(2) << scores[c][idx];
+                auto label = label_ss.str();
+
+                int baseline;
+                auto label_bg_sz = cv::getTextSize(label.c_str(), cv::FONT_HERSHEY_COMPLEX_SMALL, 1, 1, &baseline);
+                cv::rectangle(frame_RGB, cv::Point(rect.x, rect.y - label_bg_sz.height - baseline - 10), cv::Point(rect.x + label_bg_sz.width, rect.y), color, cv::FILLED);
+                cv::putText(frame_RGB, label.c_str(), cv::Point(rect.x, rect.y - baseline - 5), cv::FONT_HERSHEY_COMPLEX_SMALL, 1, cv::Scalar(0, 0, 0));
+
+                if (class_names[c] == prefered_class || prefered_class == "all")
+                {
+                    if (abs(sqrt(pow(rect.x + rect.width - FOV_x / 2, 2) + pow(rect.y + rect.height - FOV_y / 2, 2))) < abs(sqrt(pow(closest.x - FOV_x / 2, 2) + pow(closest.y - FOV_y / 2, 2)))) {
+                        closest = cv::Point((rect.x + rect.width / 2) + offset_x, static_cast<int>((rect.y + (rect.height / of_parts * part)) + offset_y));
+                    }
+                }
+            }
+        }
+#pragma endregion
+
+        //aim
+#pragma region
+        if (closest != cv::Point(FOV_x, FOV_y))
+        {
+            //draw the line from center to the closest detection - mainly for testing reasons 
+            cv::line(frame_RGB, cv::Point(FOV_x / 2, FOV_y / 2), closest, cv::Scalar(255, 0, 0), 1, cv::LINE_AA);
+
+            //absolute move
+            move = cv::Point(static_cast<int>((closest.x - FOV_x / 2) * sensitivity), static_cast<int>((closest.y - FOV_y / 2) * sensitivity));
+
+            //if A key is pressed
+            if ((GetKeyState(VK_XBUTTON2) & 0x80) != 0) //GetKeyState('A') & 0x8000 // (GetKeyState(VK_LBUTTON) & 0x80) != 0 //(GetKeyState(VK_CAPITAL) & 0x0001) != 0
+            {
+                //Aimbot
+                if (aim_option == 0)
+                {
+                    click = ";0";
+                    send = std::to_string(move.x) + ":" + std::to_string(move.y) + click;
+                    WriteFile(hSerial, &send, sizeof(send), NULL, NULL);
+                }
+
+                //Triggerbot
+                if (aim_option == 1)
+                {
+                    if (move.x < trig_distance && move.y < trig_distance)
+                    {
+                        click = ";3";
+                        send = "0:0" + click;
+                        WriteFile(hSerial, &send, sizeof(send), NULL, NULL);
+                    }
+
+                }
+
+                //Aim go brrr
+                if (aim_option == 2)
+                {
+                    if (move.x < trig_distance && move.y < trig_distance) {
+                        click = ";1";
+                    }
+
+                    else {
+                        click = ";0";
+                    }
+
+                    send = std::to_string(move.x) + ":" + std::to_string(move.y) + click;
+                    WriteFile(hSerial, &send, sizeof(send), NULL, NULL);
+                }
+            }
+        }
+#pragma endregion
+
+
+        //FPS
+#pragma region
+        auto stop = std::chrono::high_resolution_clock::now();
+        auto duration = std::chrono::duration_cast<std::chrono::microseconds>(stop - start);
+        cv::putText(frame_RGB, std::to_string(1000000 / duration.count()), cv::Point(10, 15), cv::FONT_HERSHEY_COMPLEX_SMALL, 1, cv::Scalar(0, 0, 255));
+#pragma endregion
+
+        //show image
+        cv::circle(frame_RGB, cv::Point(FOV_x / 2, FOV_y / 2), 0, (255, 255, 255), 3);
+        cv::imshow("", frame_RGB);
+    }
+    cv::destroyAllWindows();
+}
